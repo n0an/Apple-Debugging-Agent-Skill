@@ -1,0 +1,8 @@
+interface:
+  display_name: "Apple Debugging"
+  short_description: "Debugs Apple platform apps with LLDB and Xcode."
+  brand_color: "#147EFB"
+  default_prompt: "Use $apple-debugging to debug this issue with LLDB without rebuilding the app."
+
+policy:
+  allow_implicit_invocation: true

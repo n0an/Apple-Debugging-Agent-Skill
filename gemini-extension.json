@@ -1,0 +1,5 @@
+{
+  "name": "apple-debugging",
+  "version": "1.0.0",
+  "description": "Debugs iOS, macOS, watchOS, tvOS, and visionOS apps with LLDB and Xcode: breakpoints, live state inspection and mutation, view debugging, watchpoints, memory, crash symbolication, custom LLDB commands, and DTrace"
+}

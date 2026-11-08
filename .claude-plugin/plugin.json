@@ -1,0 +1,14 @@
+{
+  "name": "apple-debugging",
+  "description": "Debugs iOS, macOS, watchOS, tvOS, and visionOS apps with LLDB and Xcode: breakpoints, live state inspection and mutation, view debugging, watchpoints, memory, crash symbolication, custom LLDB commands, and DTrace",
+  "version": "1.0.0",
+  "author": {
+    "name": "Anton Novoselov",
+    "url": "https://github.com/n0an"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/n0an/Apple-Debugging-Agent-Skill",
+  "skills": [
+    "./apple-debugging/"
+  ]
+}
