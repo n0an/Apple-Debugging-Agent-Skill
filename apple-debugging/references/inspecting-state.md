@@ -11,11 +11,11 @@ v self                 # one variable
 v self.view.frame      # a path, dynamic type resolved at each step
 v -T self              # with types
 v -R self              # raw, no formatters
-vo self                # description without compiling
+vo self                # description; may execute target code
 v -f x count           # one-off format
 p self.items.count     # evaluate (dwim-print)
 po self.items          # description
-p -- -x                # expression that starts with a minus
+expression -- -x       # expression that starts with a minus
 ```
 
 Use `v` for anything you can reach with `.`, `[]`, and `*`. Use `p` when you need a method call, arithmetic, a computed property, or an overloaded operator. Use `po` when the type's own description tells the story (view hierarchies, layers, errors, URL requests).
@@ -44,7 +44,7 @@ expression -l swift -- let $v = unsafeBitCast(0x600003a1c2e0, to: CheckoutViewCo
 p $v.cart.items.count
 ```
 
-`unsafeBitCast` returns a typed object, so property access and method calls work. The Objective-C route works without knowing the type at all, including for Swift classes that inherit from `NSObject`.
+`unsafeBitCast` assumes the address is a live instance of the specified class; a wrong address or type can crash or corrupt the process. Do not cast a Swift struct or an address from an earlier run this way. The Objective-C route works without knowing the type at all, including for Swift classes that inherit from `NSObject`.
 
 ## Frames without source: registers and $arg
 
@@ -67,7 +67,7 @@ po [$arg1 class]       # which subclass this is
 po (char *)$arg2       # the selector as a C string
 ```
 
-Count the colons in the selector to know how many parameters follow `$arg2`. Registers are reliable at the first instruction of a function; `settings set target.skip-prologue false` makes breakpoints stop there instead of after the prologue. Swift's convention differs (self is often in a different register or on the stack), so for Swift frames without source prefer `disassemble` plus `register read` over `$arg`.
+The register table describes ordinary C/Objective-C integer and pointer arguments. Floating-point/vector arguments use other registers, and aggregates can be split or passed indirectly. Selector colons count parameters, not integer registers. Registers are reliable at the first instruction of a function; `settings set target.skip-prologue false` makes breakpoints stop there instead of after the prologue. Swift's convention differs (self is often in a different register or on the stack), so for Swift frames without source prefer `disassemble` plus `register read` over `$arg`.
 
 ```
 register read                 # general purpose registers
@@ -117,7 +117,7 @@ image dump symtab MyApp
 
 ## Objective-C runtime introspection
 
-These private helpers exist on every `NSObject` in the iOS and macOS runtimes and work in an Objective-C expression even for Swift subclasses of `NSObject`:
+These private helpers are available on some OS/framework combinations, including many NSObject subclasses. Check runtime availability and keep them out of shipped code:
 
 ```
 expression -l objc -O -- [$v _ivarDescription]          # every ivar with values
@@ -135,7 +135,7 @@ Swift:
 p type(of: value)
 po dump(value)                        # structure with child values
 p Mirror(reflecting: value).children.map { $0.label }
-language swift refcount object        # retain counts of a Swift object
+language swift refcount object        # diagnostic snapshot, not proof of ownership or a leak
 ```
 
 ## Memory
@@ -165,15 +165,15 @@ disassemble -n "-[UIViewController viewDidLoad]"
 disassemble -a 0x1045c2e10
 ```
 
-Xcode: Debug > Debug Workflow > Always Show Disassembly. The green marker is the next instruction; the `bl` (arm64) or `call` (x86_64) just above it is the call that reached the current function.
+Xcode: Debug > Debug Workflow > Always Show Disassembly. The green marker is the next instruction. Inspect the caller frame and disassembly to locate the incoming call; the instruction preceding the current PC is not necessarily that call.
 
 ## Run loop and UI state from anywhere
 
-Paused with the pause button, you have no `self`, but globals are always reachable:
+If the selected frame has no useful `self`, inspect known application globals. UIKit examples require `$window` selected via [View debugging](view-debugging.md); expression evaluation and imports must still work:
 
 ```
-expression -l objc -O -- [[[UIApplication sharedApplication] keyWindow] recursiveDescription]
-expression -l objc -O -- [[[[UIApplication sharedApplication] keyWindow] rootViewController] _printHierarchy]
+expression -l objc -O -- [$window recursiveDescription]
+expression -l objc -O -- [[$window rootViewController] _printHierarchy]
 expression -l objc -O -- [[UIApplication sharedApplication] delegate]
 expression -l objc -O -- [NSThread callStackSymbols]
 expression -l objc -O -- [[NSBundle mainBundle] bundlePath]

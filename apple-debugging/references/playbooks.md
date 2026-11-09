@@ -2,6 +2,8 @@
 
 Step-by-step recipes for the situations that come up most. Each assumes the app is running under a debugger (see `attaching-and-running.md`).
 
+For UIKit window expressions, first select `$window` using [View debugging](view-debugging.md). Use the mutation and control-flow constraints in [Modifying runtime state](modifying-runtime-state.md) before the recipes that skip or stub code.
+
 ## 1. Fix a layout constant without rebuilding
 
 1. Capture the view hierarchy (debug bar button) and select the misplaced view.
@@ -27,7 +29,7 @@ Step-by-step recipes for the situations that come up most. Each assumes the app 
 
 1. Symbolic breakpoint on the setter: `-[UILabel setText:]` (Objective-C) or `rb Cart.total.setter` (Swift).
 2. It fires too often? Add a condition on the value (`(BOOL)[(id)$arg3 containsString:@"0 ft"]`) or on the receiver, or make it dependent: a breakpoint on the function that runs right before the interesting update with the action `breakpoint set --one-shot true --name "-[UILabel setText:]"` and auto-continue.
-3. When it stops: `po $arg1` to confirm the receiver, then `bt` or click the next frame up to land in your code.
+3. At Objective-C setter entry, inspect the receiver through `$arg1`; in Swift use `v self` when available. Read `bt` and select the calling frame to find the decision in your code.
 4. No setter is ever called? Use a watchpoint (playbook 7).
 
 ## 5. Find who presented or dismissed a view controller
@@ -100,17 +102,40 @@ Step-by-step recipes for the situations that come up most. Each assumes the app 
 
 1. Get the views: `pviews` alias (recursive description), copy the addresses.
 2. `expression -l objc -- id $a = (id)0x...; id $b = (id)0x...`.
-3. Nudge with `[$a setCenter:CGPointMake(200, 120)]; (void)[CATransaction flush]`, or a `nudge` Python command (see `custom-commands.md`); Enter repeats.
+3. Nudge with `[$a setCenter:CGPointMake(200, 120)]; (void)[CATransaction flush]`, or a reviewed helper command; Enter repeats.
 4. Read back `po [$a frame]` and transfer the numbers to constraints.
 
 ## 16. Drive the debugger from a terminal for someone else
 
-```
-timeout 120 xcrun lldb --batch \
-  -o "process attach --name MyApp" \
-  -o "breakpoint set -n '-[UIViewController viewDidAppear:]' -C 'po NSStringFromClass([\$arg1 class])' -G1" \
+```sh
+xcrun lldb --batch \
+  -o "process attach --pid $(pgrep -nx MyApp)" \
+  -o "breakpoint set -n '-[UIViewController viewDidAppear:]' -K false -C 'po (Class)[(id)\$arg1 class]' -G1" \
+  -o "script import threading; threading.Timer(120, lambda p=lldb.debugger.GetSelectedTarget().GetProcess(): p.SendAsyncInterrupt()).start()" \
   -o "continue" \
-  -o "detach" > /tmp/trace.txt 2>&1
+  -o "breakpoint delete -f" \
+  -o "process detach" > /tmp/trace.txt 2>&1
 ```
 
-The person reproduces in the Simulator while `continue` runs; the file holds the sequence of controllers that appeared. End every batch with `detach`.
+The person reproduces in the Simulator while `continue` runs; the file holds the sequence of controllers that appeared. The tracer auto-continues, so nothing stops the process: the timer interrupts it after two minutes, the batch deletes the breakpoint and detaches, and the app keeps running. Check `pgrep -nx` picked the right process when two simulators are booted. See "Driving LLDB from a terminal or an agent" in `attaching-and-running.md` for what ends a batch early.
+
+## 17. A macOS or Simulator process hangs
+
+1. Collect a timed sample before attempting expressions: `sample <pid> 5 -file /tmp/app-sample.txt`.
+2. Compare repeated stacks. Distinguish a busy loop, a legitimate wait, and a dependency cycle.
+3. Attach only if a targeted stack, variable, or register observation will resolve the remaining uncertainty. Avoid descriptions that could acquire the lock being investigated.
+4. Detach, reproduce without debugger interference, and verify the source fix.
+
+## 18. A closed-source framework behaves unexpectedly
+
+1. Identify the loaded module, architecture, and symbol with [Debugging without source](debugging-without-source.md).
+2. Trace the relevant implementation and its callers. Resolve inherited Objective-C methods through runtime lookup and break on the IMP.
+3. Test one application-level hypothesis. Preserve a minimal reproduction for a suspected framework defect and state which OS/build versions were observed.
+
+## Reduce a suspected framework bug
+
+Capture a deterministic reproduction, expected/actual behavior, OS and SDK builds, architecture, and the first relevant failure rather than only its downstream symptom. Compare a clean launch with the instrumented run. Check compiler/runtime diagnostics, error returns, queue/thread requirements, object lifetimes, and API preconditions before attributing the failure to the framework.
+
+Reduce the app to the smallest input and call sequence that still fails. Test a second supported OS/build when available, preserving differences rather than assuming the newest behavior is correct. Use a symbolic breakpoint, assembly inspection, or a scoped runtime hook to distinguish competing explanations. Keep the supported app-level workaround separate from evidence about a private implementation. Include the reproduction and trace when reporting the defect.
+
+After fixing the cause, retain the smallest useful regression test or assertion and remove temporary hooks/configuration. Do not turn a live debugging task into an unrelated refactoring project.

@@ -24,7 +24,7 @@ Simulator processes are macOS processes, so every macOS attach method works on t
 xcrun lldb /path/to/MyApp.app/Contents/MacOS/MyApp
 (lldb) process launch --stop-at-entry -- --flag value   # stop before main
 (lldb) settings set target.run-args --flag value         # or persist the args
-(lldb) settings set target.env-vars DEBUG=1 OS_ACTIVITY_MODE=disable
+(lldb) settings set target.env-vars DEBUG=1
 (lldb) process launch -E MallocStackLogging=1            # one-off environment
 (lldb) run
 
@@ -55,7 +55,7 @@ Edit Scheme (Cmd+<), Run action:
 | `-NSShowNonLocalizedStrings YES` | uppercase unlocalized strings |
 | `-AppleLanguages (de)` / `-AppleLocale de_DE` | run in another language |
 | `-UIViewLayoutFeedbackLoopDebuggingThreshold 100` | catch layout feedback loops |
-| `OS_ACTIVITY_MODE=disable` | silence system log noise in the console |
+| `OS_ACTIVITY_MODE=disable` | suppresses useful diagnostics too; remove it while investigating logs |
 | `CFNETWORK_DIAGNOSTICS=3` | verbose URL loading logs |
 | `DYLD_PRINT_LIBRARIES=1` | log every loaded image |
 
@@ -74,45 +74,51 @@ Xcode > Settings > Behaviors > Running > Pauses: show a tab named "Debug", show 
 ## Prerequisites and permissions
 
 - Your own debug builds carry the `get-task-allow` entitlement, which is what lets a debugger (and Instruments) attach. App Store and ad hoc builds do not. Check with `codesign -d --entitlements - MyApp.app`.
-- Attaching to Apple-signed processes (SpringBoard, Finder, system daemons) requires System Integrity Protection to be disabled on that Mac. Do that on a dedicated machine or VM, not your daily driver.
-- Apps that call `ptrace(PT_DENY_ATTACH, ...)` refuse debuggers. Catch them at launch: `sudo lldb -n App -w`, `rb ptrace -s libsystem_kernel.dylib`, then `thread return 0` when it stops and `continue`.
+- Attach failures come from different layers: debugger authorization, process ownership, hardened runtime, signing entitlements, or SIP protection of Apple-signed processes. Record the exact error and diagnose it with `signing-and-attach-diagnostics.md` before changing anything. `sudo` is not a universal fix.
+- Apps that call `ptrace(PT_DENY_ATTACH, ...)` refuse debuggers. For your own app, stop before the call and test the check: see `signing-and-attach-diagnostics.md`. Changing SIP or re-signing someone else's binary is a separate, persistent experiment: ask first.
 - On a device, "Developer Mode" must be on (Settings > Privacy & Security) and the device must be paired with the Mac.
 
 ## Driving LLDB from a terminal or an agent
 
-An interactive `lldb` session waits for keyboard input. Scripts and agents must use batch mode: every command is given up front, LLDB runs them in order, synchronously, and quits.
+An interactive `lldb` session waits for keyboard input. Scripts and agents use batch mode: every command is given up front, LLDB runs them in order, synchronously, and quits.
 
-```
+```sh
 xcrun lldb --batch \
-  -o "process attach --name MyApp" \
-  -o "thread backtrace all" \
-  -o "expression -l objc -O -- [[[UIApplication sharedApplication] keyWindow] recursiveDescription]" \
-  -o "detach"
+  -o 'process attach --name MyApp' \
+  -o 'thread backtrace all' \
+  -o 'process detach'
 ```
 
-Rules:
+Rules (checked on Apple LLDB `lldb-2103` with an attached macOS process):
 
-- `-o` commands run after the target is set up; `-O` commands run before. `-s file.lldb` reads commands from a file, one per line. `-Q` (`--source-quietly`) hides the echo of each command.
-- Commands run synchronously. `continue` returns when the process stops again (breakpoint, crash, signal), so the sequence `attach, breakpoint set, continue, bt, v, detach` works as a script. If nothing stops the process, `continue` blocks forever: wrap the whole call in `timeout 60 xcrun lldb --batch ...` or run it in the background with a deadline.
-- Always end with `detach` for a process you attached to, or `kill` for one you launched. Quitting LLDB with a live process kills it.
-- A process stays frozen while LLDB is attached and stopped. Do not leave it that way between steps; detach, then attach again for the next experiment.
-- Capture everything with `> /tmp/lldb-out.txt 2>&1` and read the file. Errors from one command do not stop the batch; check the output for `error:` lines before trusting later results.
-- Breakpoint actions can also be set in batch: `-o "breakpoint set -n '-[UILabel setText:]' -C 'po \$arg1' -C 'po (SEL)\$arg2' -G1"`. Escape `$` for the shell.
+- `-o` commands run after the target is set up; `-O` commands run before. `-s file.lldb` reads commands from a file, one per line. `-Q` hides the echo of each command. Add `--no-lldbinit` for an isolated run that ignores the user's init files.
+- **The first failing `-o` command ends the batch.** Everything after it, including your `process detach`, is skipped. For a read-only snapshot where a missing variable must not stop the rest, put the commands in a file and source it with errors allowed: `-o 'command source -e false /tmp/snapshot.lldb'`. Do not use that for commands that depend on each other.
+- Commands run synchronously. `continue` returns when the process stops again (breakpoint, crash, signal), so `attach, breakpoint set, continue, bt, v, detach` works as a script. If nothing stops the process (the breakpoint never hits, or every action auto-continues), `continue` blocks forever.
+- **Give a waiting batch a deadline inside LLDB.** Before `continue`, start a timer that interrupts the process: `-o "script import threading; threading.Timer(90, lambda p=lldb.debugger.GetSelectedTarget().GetProcess(): p.SendAsyncInterrupt()).start()"`. When it fires, `continue` returns with `stop reason = signal SIGSTOP` and the remaining commands run, so put `breakpoint delete -f` and `process detach` after it. A timer that has not fired yet does not delay LLDB's exit. Sending SIGINT to a batch LLDB does not interrupt `continue`.
+- **Add an outer deadline only as a safety net** for a debugger that hangs: `perl -e 'alarm shift; exec @ARGV' 180 xcrun lldb --batch ...` (stock macOS has no `timeout`; `gtimeout` exists only with coreutils). A killed LLDB loses its buffered output, including everything breakpoint actions printed, so never use the outer kill as the normal way to end a trace.
+- **What happens when LLDB exits.** A process you attached to is detached and keeps running, whether the batch finished, stopped on an error, or was killed. A process LLDB launched with `run` is killed. Still end with an explicit `process detach` (or `process kill`) so the output says what happened, then check the process with `ps -o stat= -p <pid>`: `T` means it is still stopped.
+- Only one debugger can own a process. If Xcode is debugging it, the attach fails: work through the user's Xcode console instead.
+- `--name` picks one process; with several matches (two booted simulators) attach by a PID you verified with `pgrep -fl MyApp`.
+- Capture everything with `> /tmp/lldb-out.txt 2>&1` and read the file. Search it for `error:` before trusting later results, and check the exit status: the outer kill exits with 142.
+- Breakpoint actions work in batch: `-o "breakpoint set -n '-[UILabel setText:]' -C 'po \$arg1' -C 'po (SEL)\$arg2' -G1"`. Escape `$` for the shell, or keep complex commands in a file so neither `$` nor backticks get expanded.
 - Prefer `v` and `frame variable` in scripts; expression evaluation is slower and fails in more ways.
 
 Example: find which label gets a wrong string without touching Xcode.
 
-```
-timeout 90 xcrun lldb --batch \
+```sh
+xcrun lldb --batch \
   -o "process attach --name MyApp" \
-  -o "breakpoint set -n '-[UILabel setText:]' -c '(BOOL)[(id)\$arg3 containsString:@\"0 ft\"]'" \
+  -o "breakpoint set -n '-[UILabel setText:]' -K false -c '(BOOL)[(id)\$arg3 containsString:@\"0 ft\"]'" \
+  -o "script import threading; threading.Timer(90, lambda p=lldb.debugger.GetSelectedTarget().GetProcess(): p.SendAsyncInterrupt()).start()" \
   -o "continue" \
   -o "po \$arg1" \
   -o "bt 8" \
-  -o "detach" > /tmp/label.txt 2>&1
+  -o "process detach" > /tmp/label.txt 2>&1
 ```
 
-The user taps the control in the Simulator during the `continue`; the output file has the receiver and the eight frames that led to the call.
+The user taps the control in the Simulator during the `continue`; the output file has the receiver and the eight frames that led to the call. If the 90 seconds pass first, the file shows `signal SIGSTOP` instead of `breakpoint 1.1`: the `po` and `bt` describe wherever the app was, not the label, and the process is detached and keeps running.
+
+When the agent's tools keep a terminal open (a PTY session it can type into and interrupt), an interactive session works too: interrupt with Ctrl-C at the deadline, remove your breakpoints, `process detach`, and verify the process is running.
 
 ## Detach, kill, restart
 
@@ -122,3 +128,11 @@ process kill              # terminate
 run                       # relaunch (asks to kill the current process first)
 process status            # where is it stopped and why
 ```
+
+## Launch I/O and signals
+
+`process launch -w /path/to/work -i /path/to/input -o /tmp/probe.out -e /tmp/probe.err -- arguments` sets this launch's working directory and standard streams. `-n` launches without terminal I/O; `-X true` requests shell argument expansion where supported. Inspect local help and use only the option combination needed by the target.
+
+`process handle SIGUSR1` shows the debugger's stop/pass/notify policy. To observe and then deliver an app-handled signal, record that policy before changing it, for example with `process handle -s true -p true -n true SIGUSR1`. A debugger stop and the app's receipt of the signal are separate events. Restore the original policy afterward. SIGSTOP and SIGKILL cannot be caught by an application signal handler.
+
+For attach denials, app anti-debug checks, and signing/entitlement evidence, read [Signing and attach diagnostics](signing-and-attach-diagnostics.md).

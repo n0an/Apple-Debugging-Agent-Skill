@@ -20,7 +20,7 @@ Two things people assume are broken:
 
 Skip whole libraries while stepping: `settings set target.process.thread.step-avoid-regexp '^std::|^Swift\.'`, or `settings set target.process.thread.step-avoid-libraries libswiftCore.dylib libobjc.A.dylib`.
 
-Only the current thread: hold Control-Shift while clicking Xcode's step buttons, or add `-m this-thread` to a `thread step-*` command. Every other thread stays frozen, which is the way to step through a race without the other side moving.
+Only the current thread: hold Control-Shift while clicking Xcode's step buttons, or add `-m this-thread` to a `thread step-*` command. This can suppress a race or deadlock a step that needs another thread. Use it only for a specific local observation, not as evidence that concurrent code is correct.
 
 Stepping commands stack. If you step over a line and a breakpoint inside the called function fires, inspect what you want and then `continue`: LLDB finishes the original step-over and stops at the end of your starting line. `thread plan list` shows the stack of pending steps, `thread plan discard` drops one.
 
@@ -58,7 +58,7 @@ What makes a jump unsafe:
 - Jumping backward: the function's locals are not reset, cleanups already ran.
 - Jumping over the last statement of a function: the function epilogue may not be where the line table suggests.
 
-Jump forward, one line at a time, and only over a statement you fully understand. When the goal is "replace this line", the robust pattern is a breakpoint on the line with two actions: `thread jump --by 1` and then the replacement `expression`, with auto-continue. When the goal is "do not run this function at all", use `thread return` instead of jumping to the end.
+Even one source line can cover initialization, branches, and cleanup. Inspect disassembly and line mappings first; avoid jumps in optimized code or across async suspension points. In a disposable process, a possible experiment is a breakpoint with two actions: `thread jump --by 1` and then the replacement `expression`, with auto-continue. When the goal is "do not run this function at all", use `thread return` instead of jumping to the end.
 
 ## Running code with breakpoints honored
 
@@ -82,4 +82,4 @@ Now a breakpoint inside the called method fires and you can step through it as i
 
 - `run` (`r`) in a terminal session relaunches the same binary. LLDB asks to kill the current process first.
 - In Xcode use Run Without Building (Control-click the Run button, or Product > Perform Action) when the sources did not change.
-- Remember that persistent `$` variables survive across stops in one run but not across relaunches, and watchpoints on addresses become meaningless after a relaunch.
+- Some persistent definitions can survive a relaunch within the debugger target. Their old object pointers are invalid: recreate handles and address watchpoints for each process lifetime.

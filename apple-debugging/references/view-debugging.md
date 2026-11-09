@@ -16,7 +16,7 @@ Techniques that save the most time:
 - The Object inspector shows the class, the address, and the `debugDescription`. Edit > Copy with a view selected puts its pointer on the clipboard, ready for the console.
 - With Malloc Stack Logging enabled in the scheme, the inspector shows the creation backtrace of a view or constraint. Click the jump arrow to open the line that created it; hold Shift-Control-Option while clicking to open it in a new window.
 - Apps with several windows (popovers, alerts, scenes, macOS panels) show each window as its own root item in the navigator. If a view seems missing from the capture, collapse the first root and look for the others.
-- Named colors from asset catalogs show by name in the inspector; a color with no name is hard-coded and will not adapt to appearance changes.
+- Asset color names help identify configured variants. A color without an asset name may still be a semantic or dynamic color; verify behavior under both appearances.
 - macOS: to capture an app in its active state (a popover that closes when Xcode activates), Command-click the capture button in Xcode's debug bar. Command-click sends the click without activating Xcode.
 
 SwiftUI: the view debugger shows the hosting hierarchy and the SwiftUI view tree. For "why did this body re-run", put `let _ = Self._printChanges()` at the top of `body` (or `Self._logChanges()` on recent OS versions to route it through the unified log).
@@ -25,14 +25,27 @@ SwiftUI: the view debugger shows the hosting hierarchy and the SwiftUI view tree
 
 The Environment Overrides button in the debug bar switches appearance (light/dark), dynamic type size, and accessibility options (bold text, increased contrast, reduce motion, and others) for the debugged app only. Verify every appearance after a color change instead of toggling the whole system.
 
+## Select the actual scene and window
+
+UIKit apps can have several active scenes and windows. The deprecated application-level `keyWindow` may be nil or belong to another scene. Inspect the scenes and choose the window containing the symptom, rather than selecting the first window automatically:
+
+```text
+expression -l objc -- @import UIKit;
+expression -l objc -O -- [[UIApplication sharedApplication] connectedScenes]
+expression -l objc -O -- [(UIWindowScene *)0xSCENE windows]
+expression -l objc -- UIWindow *$window = (UIWindow *)0xWINDOW
+```
+
+Replace the illustrative addresses with live addresses from those results or the view debugger. Verify the scene's activation state, window visibility, and root controller. `$window` examples below assume this selection. App extensions may not have access to `UIApplication.shared`; use a known view's `window` instead. AppKit uses `[NSApp windows]`, then a selected `NSWindow` and its `contentView`.
+
 ## Console equivalents
 
 ```
 # iOS, Objective-C context
-expression -l objc -O -- [[[UIApplication sharedApplication] keyWindow] recursiveDescription]
-expression -l objc -O -- [[[[UIApplication sharedApplication] keyWindow] rootViewController] _printHierarchy]
+expression -l objc -O -- [$window recursiveDescription]
+expression -l objc -O -- [[$window rootViewController] _printHierarchy]
 expression -l objc -O -- [$v recursiveDescription]
-expression -l objc -O -- [`self.view` recursiveDescription]      # from a Swift frame, splice the Swift value in
+expression -l objc -O -- [(id)`self.view` recursiveDescription]      # from a Swift frame, splice the Swift value in
 
 # macOS
 expression -l objc -O -- [[[NSApp keyWindow] contentView] _subtreeDescription]
@@ -75,11 +88,25 @@ Work through the delivery chain:
 1. Which view gets the touch? Symbolic breakpoint with an action, auto-continue:
    `breakpoint set -n "-[UIApplication sendEvent:]" -C "po [[[$arg3 allTouches] anyObject] view]" -G1`
    Tap. The console names the hit view for the touch began and ended phases. If it names the wrong view, something in front is catching the touch.
-2. Hit testing: `breakpoint set -n "-[UIView hitTest:withEvent:]" -c '(BOOL)[NSStringFromClass((id)[$arg1 class]) containsString:@"Toolbar"]'` to stop when your view is asked, then `po $arg1`, `finish`, and read the returned view in `$arg1`... after the return (`po $x0` on arm64, in Objective-C context).
-3. Properties that silently block touches: `isUserInteractionEnabled == false` on the view or any ancestor, `isHidden`, `alpha < 0.01`, `isEnabled == false` on a `UIControl`, a frame outside the superview bounds (visible because clipping is off, but untouchable).
+2. Hit testing: `breakpoint set -n "-[UIView hitTest:withEvent:]" -c '(BOOL)[NSStringFromClass((id)[$arg1 class]) containsString:@"Toolbar"]'` to stop when your view is asked, then inspect the receiver and step out. For a pointer return, inspect `x0` on arm64 or `rax` on x86_64 immediately after return, casting to the correct type. `$arg1` is not a portable return-value alias.
+3. Properties that silently block touches: `isUserInteractionEnabled == false` on the view or any ancestor, `isHidden`, `alpha <= 0.01`, `isEnabled == false` on a `UIControl`, a frame outside the superview bounds (visible because clipping is off, but untouchable).
 4. Gesture recognizers on ancestors with `cancelsTouchesInView` or `delaysTouchesBegan`, and scroll views that delay content touches.
 5. The responder chain: walk it from the console.
    `expression -l objc -O -- ({ id r = $v; NSMutableString *s = [NSMutableString new]; while (r) { [s appendFormat:@"%@\n", r]; r = [r nextResponder]; } s; })`
+
+## Unexpected keyboard focus changes
+
+Search before assuming `UITextField` implements the method on this OS:
+
+```text
+image lookup -rn 'becomeFirstResponder' UIKitCore
+breakpoint set -S becomeFirstResponder -K false -C 'expression -l objc -O -- (id)$arg1' -C 'bt 8' -G1
+breakpoint list
+```
+
+The selector breakpoint traces implementations across classes; narrow it to a discovered symbol or receiver if noisy. `-K false` stops before the prologue so the Objective-C receiver register is still meaningful. Reproduce the focus change and follow the caller back to application code. Trace `resignFirstResponder` separately if focus disappears.
+
+A call is a request, not proof of success. If needed, disable auto-continue, step out of the relevant method, and inspect its Boolean result using the return ABI. Check the view's window, `canBecomeFirstResponder`, and whether the current responder can resign.
 
 ## Which code handles a control
 
@@ -109,7 +136,7 @@ Snapshot a view: `expression -l objc -O -- [[$v snapshotViewAfterScreenUpdates:N
 ## Animations
 
 - Simulator: Debug > Slow Animations (Command-T) slows every animation in the Simulator.
-- Any target: `expression -l objc -- [[[UIApplication sharedApplication] keyWindow].layer setSpeed:0.1]` slows the window's layer tree; set it back to 1.
+- Any target: `expression -l objc -- [[$window layer] setSpeed:0.1]` slows the window's layer tree; set it back to 1.
 - To see the state mid-animation, pause and inspect `$v.layer.presentationLayer`, which has the on-screen values while `$v.layer` has the model values.
 - `UIView.areAnimationsEnabled` and `UIView.setAnimationsEnabled(false)` switch animations off for a session when they get in the way.
 

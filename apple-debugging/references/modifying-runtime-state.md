@@ -44,13 +44,15 @@ Alias the flush (`command alias flush expression -l objc -- (void)[CATransaction
 
 ## Keep handles to objects
 
+Select `$window` using [View debugging](view-debugging.md) before the UIKit example.
+
 ```
-expression -l objc -- id $vc = [[[[UIApplication sharedApplication] keyWindow] rootViewController] presentedViewController]
+expression -l objc -- id $vc = [[$window rootViewController] presentedViewController]
 expression -l swift -- let $vc = unsafeBitCast(0x600001234560, to: DetailViewController.self)
-p self            # result is $R0, usable later even after the frame is gone
+expression -l swift -- let $savedSelf = self   # explicit persistent handle
 ```
 
-`$` variables and `$R` results outlive the frame; `$R0` from `viewDidLoad` still drives the controller when you pause minutes later (switch to the same language context to use it).
+Persistent object variables and results can retain objects, altering a lifetime investigation. They belong to the current process and language context; `$R0` from `viewDidLoad` still drives the controller when you pause minutes later (switch to the same language context to use it).
 
 ## Call code
 
@@ -61,7 +63,7 @@ expression -l objc -O -- [[UIApplication sharedApplication] openURL:[NSURL URLWi
 expression -l swift -- $nav.pushViewController(UIViewController(), animated: true)
 ```
 
-Then flush to see the result, or `continue`. Calling into UIKit from a thread that is not the main thread while paused on a background thread can wedge things; switch to the main thread first (`thread select 1`) when the expression touches UI.
+Then flush to see the result, or `continue`. Calling into UIKit from a thread that is not the main thread while paused on a background thread can wedge things; use `thread list` to identify the main thread, then select its actual index. Do not assume it is thread 1 or synchronously dispatch to a main queue frozen by the debugger.
 
 ## Define things in the debugger
 
@@ -103,11 +105,11 @@ Breakpoint on the line, two actions, auto-continue:
 1. `thread jump --by 1`
 2. `expression jumpAstronaut(animated: false)`
 
-The original line never executes; your replacement does, every time. This is how you swap a call for a variant, remove an animation, or patch a wrong argument during a session.
+If line mappings and machine state permit this jump, the replacement executes instead. Inspect disassembly first; a one-line jump is not intrinsically safe and can skip ownership or initialization instructions. This is how you swap a call for a variant, remove an animation, or patch a wrong argument during a session.
 
 ## Stub a function
 
-Breakpoint at the function's first line, action `thread return <value>`, auto-continue. The function returns your value immediately for the rest of the session. Use it to simulate a failing network call (`thread return nil`), a feature flag (`thread return true`), or to short-circuit expensive work.
+Breakpoint at the function's first line, action `thread return <value>`, auto-continue. The function returns your value immediately for the rest of the session. Limit this to simple synchronous functions whose return ABI and cleanup you understand. It is not a general stub for async functions, coroutines, throwing functions, or complex Swift value returns.
 
 ## Prototype layout live
 
@@ -127,7 +129,7 @@ For the rare case where there is no symbol to call:
 
 ```
 register write x0 0x0             # change an argument or a return value at the right moment
-memory write 0x600003a1c2f8 0x01  # flip a byte
+memory write --size 1 0x600003a1c2f8 0x01  # write exactly one byte
 register write pc 0x1045c2e10     # redirect execution (same risks as thread jump)
 ```
 

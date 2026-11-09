@@ -1,6 +1,6 @@
 # Custom commands
 
-Any command typed twice belongs in `~/.lldbinit`. LLDB offers three tiers: aliases for fixed text, regex commands for input you need to place inside a template, and Python for anything with logic, options, or formatted output.
+Any command typed twice deserves a name. Try it for the session first, then persist it in `~/.lldbinit` (ask before editing someone else's init file). LLDB offers three tiers: aliases for fixed text, regex commands for input you need to place inside a template, and Python for anything with logic, options, or formatted output.
 
 ## Where init files live
 
@@ -8,14 +8,18 @@ Any command typed twice belongs in `~/.lldbinit`. LLDB offers three tiers: alias
 |---|---|
 | `~/.lldbinit-Xcode` | only when Xcode drives LLDB |
 | `~/.lldbinit-lldb` | only for the terminal `lldb` |
-| `~/.lldbinit` | always, after the contextual file |
+| `~/.lldbinit` | fallback when no application-specific init file exists |
 | scheme > Run > Options > LLDB Init File | per project, after the global files (Xcode 14+) |
 
-Init files run before the process is attached, so they cannot evaluate expressions against the target. They can define aliases, import scripts, set settings, and configure breakpoint names. Syntax errors in them are reported quietly at startup; reload during a session to see them:
+The application-specific init file takes precedence, not additive ordering. To share common settings, explicitly source `~/.lldbinit` from that file. A working-directory `.lldbinit` is normally not trusted automatically; source a reviewed file explicitly instead of enabling arbitrary project init files globally.
+
+Init files normally run before the process is attached, so they cannot evaluate expressions against the target. They can define aliases, import scripts, set settings, and configure breakpoint names. Syntax errors in them are reported quietly at startup; reload during a session to see them:
 
 ```
 command alias reload command source ~/.lldbinit
 ```
+
+UI aliases below require a live `$window` selected as described in [View debugging](view-debugging.md).
 
 ## command alias
 
@@ -26,7 +30,7 @@ command alias sp expression -l swift --
 command alias flush expression -l objc -- (void)[CATransaction flush]
 command alias args register read arg1 arg2 arg3 arg4 arg5 arg6
 command alias bfl breakpoint set -f %1 -l %2                     # bfl Foo.swift 42
-command alias -H "Print the key window's view tree" -h "Dump views" -- pviews expression -l objc -O -- [[[UIApplication sharedApplication] keyWindow] recursiveDescription]
+command alias -H "Print the selected window's view tree" -h "Dump views" -- pviews expression -l objc -O -- [$window recursiveDescription]
 ```
 
 - `%1`, `%2` substitute positional arguments. Anything after the alias name that is not consumed is appended to the end of the expansion.
@@ -44,103 +48,99 @@ command regex getcls 's/(([0-9]|\$|\@|\[).*)/cpo [%1 class]/' 's/(.+)/expression
 ```
 
 - Patterns are tried in order; the first match wins. Unmatched input is discarded with a bare error, so finish with a catch-all `s/(.+)/.../`.
-- Input that starts with `[`, `@`, `$`, or a digit is almost always Objective-C; everything else is probably Swift. That heuristic is how `getcls` above picks a language.
+- The `getcls` dispatch above is only a heuristic. Swift persistent variables also start with `$`; use explicit `cpo` or `spo` when the language is known.
 - One line only. Join statements with `;`.
 - Iterate against a live process by redefining the command, then paste the final version into `~/.lldbinit`.
 
 ## Python commands
 
-A command is a function with a fixed signature, registered from the module's init hook:
+A command is a function with the five-argument signature, registered from the module's init hook. `exe_ctx` is the context the command runs in, including when a breakpoint action calls it. This is the shape of `scripts/uitools.py`, shipped with this skill:
 
 ```python
-# ~/lldb/uitools.py
-import lldb
-import shlex
+# uitools.py (excerpt)
 import argparse
+import shlex
+import lldb
 
 
-def flush(debugger):
-    debugger.HandleCommand("expression -l objc -- (void)[CATransaction flush]")
+class Parser(argparse.ArgumentParser):
+    def error(self, message):                  # argparse would call sys.exit inside LLDB
+        raise ValueError(self.format_usage().strip())
 
 
-def vmove(debugger, command, result, internal_dict):
-    """vmove <dx> <dy> <view-expression>: nudge a view and redraw while paused."""
-    parser = argparse.ArgumentParser(prog="vmove")
-    parser.add_argument("dx", type=float)
-    parser.add_argument("dy", type=float)
-    parser.add_argument("view", nargs="+")
+def vmove(debugger, command, exe_ctx, result, internal_dict):
+    """vmove <dx> <dy> <view-expression>: move a view's center and redraw while paused."""
     try:
+        parser = Parser(prog="vmove", add_help=False)
+        parser.add_argument("dx", type=float)
+        parser.add_argument("dy", type=float)
+        parser.add_argument("view", nargs="+")
         args = parser.parse_args(shlex.split(command))
-    except SystemExit:
-        result.SetError("usage: vmove <dx> <dy> <view-expression>")
-        return
-    view = " ".join(args.view)
-    expr = ("expression -l objc -- CGPoint $c = [(UIView *)(%s) center]; "
-            "[(UIView *)(%s) setCenter:CGPointMake($c.x + %f, $c.y + %f)]"
-            % (view, view, args.dx, args.dy))
-    debugger.HandleCommand(expr)
-    flush(debugger)
-    result.AppendMessage("moved %s by (%g, %g)" % (view, args.dx, args.dy))
-
-
-def fview(debugger, command, result, internal_dict):
-    """fview <regex>: list views in the key window whose description matches."""
-    import re
-    res = lldb.SBCommandReturnObject()
-    interp = debugger.GetCommandInterpreter()
-    interp.HandleCommand(
-        "expression -l objc -O -- [[[UIApplication sharedApplication] keyWindow] recursiveDescription]", res)
-    if not res.Succeeded():
-        result.SetError(res.GetError())
-        return
-    pattern = re.compile(command.strip())
-    for line in res.GetOutput().splitlines():
-        if pattern.search(line):
-            result.AppendMessage(line.strip(" |"))
+        frame = exe_ctx.GetFrame()
+        if not frame.IsValid():
+            raise ValueError("Pause the process and select a frame first.")
+        options = lldb.SBExpressionOptions()
+        options.SetLanguage(lldb.eLanguageTypeObjC_plus_plus)
+        options.SetTimeoutInMicroSeconds(3000000)
+        view = " ".join(args.view)
+        # Return a value: an expression whose result is void reports "unknown error".
+        value = frame.EvaluateExpression(
+            "@import UIKit; UIView *v = (UIView *)({}); CGPoint c = [v center]; "
+            "[v setCenter:CGPointMake(c.x + {}, c.y + {})]; [CATransaction flush]; "
+            "NSStringFromCGRect([v frame])".format(view, args.dx, args.dy), options)
+        if value.GetError().Fail():
+            raise ValueError(str(value.GetError()))
+        result.AppendMessage("moved, frame is now " + value.GetObjectDescription())
+    except ValueError as error:
+        result.SetError(str(error))
 
 
 def __lldb_init_module(debugger, internal_dict):
-    debugger.HandleCommand("command script add -f uitools.vmove vmove")
-    debugger.HandleCommand("command script add -f uitools.fview fview")
+    debugger.HandleCommand("command script add -o -f {}.vmove vmove".format(__name__))
 ```
 
-Load it from `~/.lldbinit`: `command script import ~/lldb/uitools.py`. During development, re-import the file (`command script import` again) or `command source ~/.lldbinit` to pick up changes.
+The full file also has `fview <regex>`, which filters `[$window recursiveDescription]` down to matching lines. Load it with `command script import /absolute/path/apple-debugging/scripts/uitools.py`, for the session or from `~/.lldbinit`. Re-running `command script import` reloads the file after an edit; `-o` on `command script add` lets the reload replace the command.
 
 Conventions:
 
-- `command` is the raw argument string; parse it with `shlex` plus `argparse` or `optparse`.
+- `command` is the raw argument string; parse it with `shlex` plus `argparse`, and override `error` so a bad argument reports through `result.SetError` instead of raising `SystemExit` inside LLDB.
 - Write output through `result.AppendMessage` and errors through `result.SetError`, not `print`, so the output composes with other commands and Xcode.
-- Capture another command's output with your own `SBCommandReturnObject`, as `fview` does, instead of letting it hit the console.
-- Never use `lldb.frame`, `lldb.thread`, `lldb.process`, or `lldb.target` inside a command; they are snapshots for the interactive `script` REPL and go stale while a script runs. Walk from `debugger.GetSelectedTarget()` down to the process, thread, and frame.
-- Prototype API calls in the REPL (`script`), then move them into the file. `script help(lldb.SBFrame)` and `script dir(lldb.SBValue)` show what is available.
-- LLDB's Python is the one bundled with Xcode, Python 3. Check with `script import sys; print(sys.version)`.
+- For `EvaluateExpression`, set the language, a timeout in microseconds, and check `GetError()`: a failed evaluation still returns an `SBValue`. An expression whose result is `void` also reports an error ("unknown error"), so end the expression with a value you can check. To capture another command's output, run it into your own `SBCommandReturnObject` and check `Succeeded()`.
+- Never use `lldb.frame`, `lldb.thread`, `lldb.process`, or `lldb.target` inside a command; they are snapshots for the interactive `script` REPL and go stale while a script runs. Use `exe_ctx`, or the `frame` a breakpoint callback receives.
+- Do not evaluate expressions from a formatter merely to display a value. It can recurse, deadlock, or change the process being inspected.
+- Prototype API calls in the REPL (`script`), then move them into the file. `script help(lldb.SBFrame)` and `script dir(lldb.SBValue)` show what is available. LLDB's Python is the one bundled with Xcode; check it with `script import sys; print(sys.version)`.
 
-The object model, top to bottom: `SBDebugger` > `SBTarget` (the executable and its modules) > `SBProcess` (memory, threads) > `SBThread` (frames, stepping) > `SBFrame` (variables, registers) > `SBValue` (any value, with children, type, summary, and `GetValueForExpressionPath`). `target.EvaluateExpression("...")` returns an `SBValue`; always check `.error.Success()` because a failed evaluation still returns an object.
+The object model, top to bottom: `SBDebugger` > `SBTarget` (the executable and its modules) > `SBProcess` (memory, threads) > `SBThread` (frames, stepping) > `SBFrame` (variables, registers) > `SBValue` (any value, with children, type, summary, and `GetValueForExpressionPath`).
 
 ## Breakpoint callbacks in Python
 
 ```
 breakpoint set -n "-[UILabel setText:]" -N labels
 breakpoint command add -s python labels
-> text = frame.EvaluateExpression("(id)$arg3", lldb.SBExpressionOptions())
-> print("label text:", text.GetObjectDescription())
+> text = frame.EvaluateExpression("(id)$arg3")
+> print("label text:", text.GetObjectDescription() if text.GetError().Success() else text.GetError())
 > return False          # False continues, True stops
 > DONE
 ```
 
-Or in a file:
+Or in `labeltools.py` (import it before registering the callback):
 
 ```python
+import lldb
+
 def log_label(frame, bp_loc, internal_dict):
     opts = lldb.SBExpressionOptions()
     opts.SetLanguage(lldb.eLanguageTypeObjC)
-    receiver = frame.EvaluateExpression("(id)$arg1", opts).GetObjectDescription()
-    text = frame.EvaluationExpression if False else frame.EvaluateExpression("(id)$arg3", opts).GetObjectDescription()
-    print("%s <- %s" % (receiver, text))
+    receiver = frame.EvaluateExpression("(id)$arg1", opts)
+    text = frame.EvaluateExpression("(id)$arg3", opts)
+    if any(not v.IsValid() or v.GetError().Fail() for v in (receiver, text)):
+        print("Could not inspect label arguments; stopping for diagnosis")
+        return True
+    print("%s <- %s" % (receiver.GetObjectDescription(), text.GetObjectDescription()))
     return False
 ```
 
-Attach with `breakpoint command add -F uitools.log_label labels`. The callback receives the `SBFrame` and `SBBreakpointLocation`; get the thread, process, and debugger from the frame when you need them. Set `debugger.SetAsync(False)` before stepping inside a callback so the step completes before the next line runs.
+Attach with `breakpoint command add -F labeltools.log_label labels`. The callback receives the `SBFrame` and `SBBreakpointLocation`; get the thread, process, and debugger from the frame when you need them. Avoid stepping or resuming from a stop callback. Return its stop decision and let the controlling session resume. If another script changes debugger async mode, restore the previous mode in `finally`.
 
 ## Data formatters
 
@@ -151,7 +151,8 @@ type summary add --summary-string "${var.name} / ${var.age}" MyApp.Person
 type summary add -x --summary-string "${svar%#} items" "^MyApp\.Queue<.+>$"     # regex type name
 type filter add MyApp.Cart --child items --child total                           # show only some children
 type summary delete MyApp.Person
-type summary clear
+type summary delete "^MyApp\.Queue<.+>$"
+type filter delete MyApp.Cart
 ```
 
 Python summary and synthetic children:
@@ -176,7 +177,7 @@ class PairChildren:
     def update(self):
         self.first = self.valobj.GetChildMemberWithName("first")
         self.second = self.valobj.GetChildMemberWithName("second")
-        return True
+        return False  # invalidate cached children after each update
 
     def num_children(self):
         return 2
@@ -219,8 +220,8 @@ command alias cp expression -l objc --
 
 # UI
 command alias flush expression -l objc -- (void)[CATransaction flush]
-command alias -h "Dump the key window's views" -- pviews expression -l objc -O -- [[[UIApplication sharedApplication] keyWindow] recursiveDescription]
-command alias -h "Dump the view controller tree" -- pvc expression -l objc -O -- [[[[UIApplication sharedApplication] keyWindow] rootViewController] _printHierarchy]
+command alias -h "Dump the selected window's views" -- pviews expression -l objc -O -- [$window recursiveDescription]
+command alias -h "Dump the view controller tree" -- pvc expression -l objc -O -- [[$window rootViewController] _printHierarchy]
 command regex tv 's/(.+)/expression -l objc -- [%1 setHidden:![%1 isHidden]]; (void)[CATransaction flush]/'
 command regex border 's/(.+)/expression -l objc -- [[%1 layer] setBorderWidth:2]; [[%1 layer] setBorderColor:[[UIColor redColor] CGColor]]; (void)[CATransaction flush]/'
 
@@ -233,7 +234,29 @@ command alias args register read arg1 arg2 arg3 arg4 arg5 arg6
 # session
 command alias reload command source ~/.lldbinit
 settings set target.max-string-summary-length 10000
-command script import ~/lldb/uitools.py
+command script import /absolute/path/apple-debugging/scripts/uitools.py
 ```
 
 Keep it short and commented; the file is read at every launch and errors are easy to miss.
+
+## Third-party command packages
+
+Public LLDB command collections add view-tree, heap-search, class-dump, and tracing commands. Before writing your own, check what is installed: `command script list`, then `help <command>`. Before importing one, read its source: these packages run Python in the debugger, and many commands evaluate code in the target or act on every match (some search commands run an action on each found object). Import a package by absolute path for the session; installing it or adding it to a global init file is a separate change. Older packages can assume Python 2, Intel registers, or `keyWindow`; read the import error instead of reinstalling. Keep them as dependencies: a link or an original explanation does not relicense their code under this skill's license.
+
+Built-in equivalents for the common package commands:
+
+| Need | Built-in way |
+|---|---|
+| View tree | `[$window recursiveDescription]`, AppKit `[[window contentView] _subtreeDescription]` |
+| Find a view or controller | view debugger, or `fview <regex>` from `scripts/uitools.py` |
+| Break on an inherited method | runtime IMP lookup, then `breakpoint set -a` (see `debugging-without-source.md`) |
+| Watch an Objective-C ivar | ivar offset from `_ivarDescription` or debug info, then `watchpoint set expression` |
+| Responder chain | follow `nextResponder` from the selected object (see `view-debugging.md`) |
+| Highlight or hide a view | `border` and `tv` regex commands in the starter file above |
+| Accessibility labels | Accessibility Inspector, or the element's `accessibilityLabel` and `accessibilityIdentifier` |
+| UI-test element tree | `XCUIElement.debugDescription` in the UI-test process |
+| Which view got the touch | an auto-continuing `sendEvent:` breakpoint that logs (see `view-debugging.md`) |
+
+A tap logger built on `thread return` swallows the event it reports, so the tap never reaches the app. Use a logging breakpoint that continues instead.
+
+For bounded symbol/method/block helpers, structured SBValue inspection, malloc history, and embedded Python troubleshooting, read [Advanced Python](advanced-python.md). For custom breakpoint resolvers and multi-stage stepping, read [Remote and tooling](remote-and-tooling.md).

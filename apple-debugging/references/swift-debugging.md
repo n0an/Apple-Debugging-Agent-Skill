@@ -5,9 +5,9 @@ Swift adds a second failure mode to the debugger: the variables view can be fine
 ## Two halves of LLDB
 
 - The debugger half powers `frame variable` (`v`) and Xcode's variables view. It needs debug info (DWARF from the build or the dSYM) and Swift reflection metadata. It reads memory and never compiles.
-- The compiler half powers `expression`, `p`, and `po`. It needs Swift modules: the SDK's textual interfaces, your app's and frameworks' binary `.swiftmodule` files, Clang modules for Objective-C imports, bridging headers. Module problems break the compiler half only.
+- The compiler half powers `expression` and expression-evaluation paths of `p` and `po`. It needs Swift modules: the SDK's textual interfaces, your app's and frameworks' binary `.swiftmodule` files, Clang modules for Objective-C imports, bridging headers. Module problems break the compiler half only.
 
-So: `v` works and `po` does not means a module problem. Nothing works means a debug info problem (wrong build configuration, missing dSYM, path mismatch).
+If `v` works and expressions fail, investigate the evaluator, language, imports, and description code. If both fail, also check frame/scope, optimization, lifetime, and debug information. Neither observation identifies a single cause.
 
 ## First response when an expression fails
 
@@ -17,16 +17,16 @@ So: `v` works and `po` does not means a module problem. Nothing works means a de
    - A framework's binary `.swiftmodule` missing from the build products or the dSYM; for static libraries the module must be registered with the linker (`-add-ast-path`) so `dsymutil` collects it. Check the build log, or `dsymutil -s MyApp | grep swiftmodule`.
    - Serialized search paths from another machine inside a prebuilt `.swiftmodule`; build vendor modules with `SWIFT_SERIALIZE_DEBUGGING_OPTIONS = NO`, or supply paths in LLDB with `settings set target.swift-module-search-paths` and `target.swift-framework-search-paths`.
    - A module compiled with a different Swift compiler than LLDB's. Rebuild with the current Xcode.
-   - A stale module cache. Delete `~/Library/Developer/Xcode/DerivedData/ModuleCache.noindex` and the project's DerivedData, then rebuild.
+   - A stale module cache. Capture the healthcheck first, then try an isolated build or remove only the affected project cache when the evidence points there; do not erase all DerivedData as the first response.
    - Optimization. `-O` builds inline, reorder, and drop variables; debug the `Debug` configuration, or set `SWIFT_OPTIMIZATION_LEVEL = -Onone` for the target under investigation.
 
 Common messages and what they usually mean: "Couldn't lookup symbols" (the expression references something the module context does not know; import the module or use `v`), "Cannot load Swift type information" / "missing module" (module import failure; healthcheck), `<could not resolve type>` (debug info does not describe the type; often optimization or a stripped framework), "error: use of unresolved identifier 'UIView'" (import the framework in the expression: `e import UIKit`).
 
 ## Static versus dynamic types
 
-Declared as a protocol or a superclass, stored as a concrete type: `p activity.name` fails because the compiler only sees the static type `Activity`. Either cast (`p (activity as! Trip).name`) or use `v activity.name`, which resolves the dynamic type at every step of the path.
+Declared as a protocol or a superclass, stored as a concrete type: `p activity.name` can fail on the expression path because the compiler only sees the static type `Activity`. Either cast (`p (activity as! Trip).name`) or use `v activity.name`, which resolves the dynamic type at every step of the path.
 
-`p` resolves the dynamic type of the final result only. `v` resolves it for every component. That makes `v` strictly more capable for drilling into protocol-typed or class-typed values.
+This distinction applies when `p` uses the expression evaluator. Modern `p` can use the same variable-path lookup as `v`. Neither command can recover data that optimization removed.
 
 ## Optimized code
 
@@ -37,21 +37,21 @@ Frames tagged `[opt]` came from optimized compilation. Expect: variables shown a
 - Types are module-qualified in the debugger: `MyApp.CheckoutViewController`, `Swift.Optional<Swift.String>`. Use the qualified name in `type summary add` and in `image lookup -t`.
 - Mangled symbols start with `$s`. `xcrun swift-demangle` decodes them. Breakpoints accept demangled forms, partial names, and regexes: `rb 'Checkout.*total\.setter'`.
 - A property has `.getter`, `.setter`, and `.modify` accessors with their own symbols. Break on the setter to catch writes that go through it.
-- A Swift method exposed to Objective-C has two symbols (the thunk and the body). Symbolic breakpoints hit the thunk first; continue once.
+- A Swift method exposed to Objective-C can resolve to a thunk and a native body. Inspect `breakpoint list` and the current frame; disable only the unwanted location rather than assuming the hit order.
 
 ## Make your types print well
 
-- `po`: conform to `CustomDebugStringConvertible` and implement `debugDescription`. `CustomReflectable` customizes the children `dump` and the variables view show.
+- `po`: conform to `CustomDebugStringConvertible` and implement `debugDescription`. `CustomReflectable` customizes `Mirror` and `dump`; LLDB variable formatters do not generally execute `customMirror` to populate their children.
 - `p` and the variables view: the `@DebugDescription` macro (Swift 6, Xcode 16) turns a `debugDescription` built from string interpolation of stored properties into an LLDB type summary. It works without running code, so it also works for values inside collections and in situations where `po` cannot evaluate. Keep the body to literals and stored property paths; computed properties and function calls disqualify the macro.
-- Session-only, no code change: `type summary add MyApp.Trip --summary-string "${var.name} (${var.destinations})"`, or a Python summary function (see `custom-commands.md`). Summaries persist until `type summary delete` or `type summary clear`, and survive relaunches within one Xcode session.
+- Session-only, no code change: `type summary add MyApp.Trip --summary-string "${var.name} (${var.destinations})"`, or a Python summary function (see `custom-commands.md`). Summaries persist until `type summary delete` (remove only the summaries created for the experiment), and survive relaunches within one Xcode session.
 
 ## Concurrency
 
 - An `async` function is split into partial functions around each `await`. The backtrace reconstructs the logical chain, so you still see the awaiting caller above the current frame.
 - After an `await`, execution may resume on a different thread. Stepping over an `await` can leave you on another thread or lose the thread; prefer a breakpoint on the line after the `await`.
 - `bt all` lists threads, not tasks. To understand which task is where, log task-local values or use `Task` names where available.
-- Data races show up as crashes with exclusivity or memory errors; Thread Sanitizer (Simulator and macOS) pinpoints them.
-- Actor isolation errors at runtime (dispatch to the wrong actor from Objective-C callbacks) are caught by the Main Thread Checker for UI and by Swift 6 strict concurrency at compile time.
+- Data races can appear as intermittent corruption, wrong values, or crashes; Thread Sanitizer (Simulator and macOS) can identify conflicting accesses in instrumented runs.
+- Main Thread Checker detects selected UI API misuse, not arbitrary actor violations. Use Swift concurrency diagnostics and runtime isolation checks for actor issues; Thread Sanitizer does not prove actor correctness or detect every race.
 
 ## SwiftUI
 
@@ -66,4 +66,4 @@ Insert `.print("label")` into a pipeline to log every event, `.breakpoint(receiv
 
 ## Expression performance
 
-The first Swift expression in a session imports modules and can take seconds; later ones are faster. Large projects with many modules feel slow in `po`; `v` stays instant. Breakpoint conditions in Swift are compiled on every hit, so keep them cheap or use an ignore count.
+The first Swift expression in a session imports modules and can take seconds; later ones are faster. Large projects with many modules can feel slow in `po`; `v` usually avoids that import cost. Conditions are evaluated at hits that reach the condition check; compilation can be cached. Debugger round trips and target execution still make hot conditional breakpoints expensive.

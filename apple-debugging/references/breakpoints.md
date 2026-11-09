@@ -77,11 +77,13 @@ breakpoint modify -i 10 2                      # ignore ten hits
 breakpoint modify -c '' 2                      # clear the condition
 ```
 
-Dependent breakpoints: make breakpoint A set breakpoint B and continue, so B only exists after A ran once. In Xcode this is a Debugger Command action on A: `breakpoint set --one-shot true --name "-[UILabel setText:]"` with auto-continue. On the console:
+Dependent breakpoints: make breakpoint A set breakpoint B and continue, so B only exists after A runs. For a single investigation, make both one-shot so repeated hits on A do not create duplicate breakpoints. In Xcode this is a Debugger Command action on A: `breakpoint set --one-shot true --name "-[UILabel setText:]"` with auto-continue. On the console:
 
 ```
-breakpoint set -n jumpCompleted -C "breakpoint set -o 1 -n '-[UILabel setText:]'" -G1
+breakpoint set -n jumpCompleted --one-shot true -C "breakpoint set --one-shot true -n '-[UILabel setText:]'" -G1
 ```
+
+`--one-shot` / `-o` requires a Boolean value, such as `true` or `1`. If A must remain active, reuse and enable an existing disabled B instead of creating a new B on every hit. Arming B establishes ordering, not causality: unrelated asynchronous work can hit it first. Filter by the relevant receiver or request identifier when possible.
 
 `tbreak File.swift:44` creates a one-shot breakpoint directly.
 
@@ -99,7 +101,7 @@ Xcode 13+ draws an unresolved breakpoint with a dashed icon; hover for the reaso
 - The library is not loaded yet. The breakpoint resolves later when the framework loads.
 - The class does not override the method. `-[MyViewController viewDidAppear:]` has no symbol if only `UIViewController` implements it. Break on the implementation and filter: `breakpoint set -n "-[UIViewController viewDidAppear:]" -c '(BOOL)[(id)$arg1 isKindOfClass:[MyViewController class]]'` (use `$arg1` because there is no `self` in a frame without debug info).
 - Swift names: `MyApp.CheckoutViewController.viewDidLoad()`, or just `CheckoutViewController.viewDidLoad`; LLDB matches partial names. Properties: `MyApp.Cart.total.setter`. When in doubt use `rb Cart.total.setter`.
-- A Swift method callable from Objective-C has two symbols: the `@objc` thunk and the Swift body. A symbolic breakpoint hits the thunk first (assembly, Objective-C context). Continue once or disable location `.1`.
+- A Swift method callable from Objective-C can resolve to a thunk and a native body. Inspect the actual locations and frame before disabling one; do not assume location `.1` is always the thunk.
 - Spaces matter in Objective-C signatures: `-[UIView hitTest:withEvent:]`, no space after the minus or inside the brackets.
 
 ## Finding the symbol before you break
@@ -107,7 +109,7 @@ Xcode 13+ draws an unresolved breakpoint with a dashed icon; hover for the reaso
 ```
 image lookup -n "-[UIView hitTest:withEvent:]"      # exact
 image lookup -rn 'hitTest' UIKitCore                # regex, one module
-image lookup -rn '(?i)becomefirstresponder'         # case-insensitive
+image lookup -rn 'becomeFirstResponder'            # use the symbol's actual spelling
 image lookup -rn 'Checkout.*total' MyApp            # Swift, your module
 ```
 
@@ -116,7 +118,7 @@ Read the `Summary:` line and use that spelling in `breakpoint set -n`, or shorte
 ## Exception and error breakpoints in practice
 
 - Exception breakpoint: stops at `objc_exception_throw` (or `__cxa_throw`). `po $arg1` prints the `NSException`; `po [$arg1 reason]`, `po [$arg1 userInfo]`, `po [$arg1 callStackSymbols]`. Some frameworks throw and catch internally during normal operation (Core Data, some image decoders); set the editor's Exception field to Objective-C only, or add a condition on the reason.
-- Swift Error breakpoint: stops in the function that throws, before the catch. `bt` shows who threw; `frame select 1` shows the state that caused it. Filter by type in the editor (Type field) or `breakpoint set -E swift -O NetworkError`.
+- Swift Error breakpoint: stops at a throw, including errors that will be handled by `catch` or `try?`. It can stop in a runtime helper such as `swift_willThrow`; use `bt` and select the actual throwing frame rather than assuming a fixed frame index. Filter by type in the editor (Type field) or `breakpoint set -E swift -O NetworkError`.
 - Runtime Issue breakpoint: pick the checker type in the editor. Without it Xcode only records the issue in the Issue navigator after the fact.
 
 ## Breakpoint names
